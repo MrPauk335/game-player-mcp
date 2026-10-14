@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "game-player-mcp"
+version = "1.0.0"
+description = "MCP server that gives an agent eyes and hands to play a game running in a window"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "computer-use", "automation", "game", "windows", "vision"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Games/Entertainment",
+  "Topic :: Software Development :: Testing",
+]
+
+# mcp 2.x: the server class is MCPServer (mcp.server.mcpserver).
+# In 1.x it was FastMCP — pin mcp<2 if you must stay on the old API.
+dependencies = [
+  "mcp>=2.0",
+  "pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/MrPauk335/game-player-mcp"
+Issues = "https://github.com/MrPauk335/game-player-mcp/issues"
+
+[project.scripts]
+game-player-mcp = "game_player_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

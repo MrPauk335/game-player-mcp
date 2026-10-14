@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Никогда не коммитить: ключи, конфиги и состояние
+keys.txt
+keys.txt.state.json
+config.json
+*.bak
+*.backup
+*.backup-*
+
+# Логи и кадры
+*.log
+frames/
+runs/
+
+# Редакторы и ОС
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
