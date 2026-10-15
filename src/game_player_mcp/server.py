@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import threading
+import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -35,14 +36,58 @@ from .executor import ActionExecutor, AgentError
 
 server = MCPServer(
     name="game-player",
-    instructions=(
-        "Control a game running in a window. Call list_windows first, then look, "
-        "then act. Coordinates are normalised 0..1 of the window's client area. "
-        "Walk with a held key ({\"type\":\"key\",\"key\":\"w\",\"hold\":2.0}), "
-        "click with move+click in one step. After every act, look again before "
-        "deciding the next move. If an action returns an error, do not repeat it "
-        "— look again and try something different."
-    ),
+    instructions="""\
+Control a game running in a window. You supply the judgement; this server only
+supplies eyes and hands.
+
+LOOK BEFORE EVERY ACTION
+1. Call look() and read the frame before deciding anything. Never act on a frame
+   you already used — the game moved on while you were thinking.
+2. Say what you see before you choose: menu or gameplay? Which counters, health,
+   ammo, hotbar slots? Where is the cursor? Is anything animating?
+3. A menu on screen swallows movement keys. If a menu is open, close it first
+   (escape, or a click on the resume button) and only then play.
+4. Check that your previous action actually did something. If the frame is
+   unchanged, it did not land.
+
+TIMING
+The screenshot is already stale when you receive it: a model round-trip costs
+2-20 s, so the game has advanced. Budget for that instead of assuming the frame
+is live.
+- Estimate your action's own duration, then the game's reaction time, and put a
+  wait between them.
+- Rough magnitudes: a click ~0.05 s, a menu transition ~0.3 s, a level or game
+  load 10-40 s, a block break in a voxel game 1-3 s.
+- After anything slow, look() again before deciding the next step.
+- Prefer a smaller number of longer, deliberate actions over a burst of tiny
+  ones you cannot observe.
+
+CLICK BURSTS
+Use autoclick rather than a long list of click actions. It holds a steady rate
+and stops by itself on whichever limit you give first:
+  {"type":"autoclick","button":"left","clicks":50,"interval":0.04}
+  {"type":"autoclick","button":"left","seconds":10,"interval":0.05}
+Give both when you are unsure: clicks bounds the burst, seconds bounds the time.
+
+HOLDING KEYS
+- {"type":"key","key":"w","hold":2.0} — one key for a fixed time.
+- {"type":"keys_hold","keys":["shift","w"],"hold":3.0} — several keys at once:
+  sprint, sneak while walking, turn while moving. Keys accept a list or a string
+  ("shift+w").
+- key_down / key_up hold across several calls; keys_hold is safer when you
+  already know the duration. release_all drops everything if you lose track.
+
+READ THE STATE FROM THE FRAME
+- menus versus gameplay
+- health, hunger, ammo, score, timers — if a number changes, something happened
+- inventory or hotbar — did the last action yield an item?
+- your own position relative to what you are trying to reach
+
+IF NOTHING CHANGED
+Do not repeat the same action. Doing it twice means the first did not land:
+look again, then change something — different coordinates, an extra wait, or a
+different key.
+""",
 )
 
 #: Состояние живёт между вызовами: окно и исполнитель с зажатыми клавишами.
@@ -117,15 +162,20 @@ def look(window: str | None = None, background: bool = False,
         if not winapi.is_foreground(win.hwnd):
             winapi.focus_window(win.hwnd)
     _state["background"] = background
+    started = time.monotonic()
     frame = capture_mod.capture(win, "client", max_width, 70,
                                 grid=show_grid, background=background)
+    capture_ms = int((time.monotonic() - started) * 1000)
     if not background:
         win = winapi.get_window(win.hwnd) or win
+    # Время в кадре — не украшение: пока агент думает, игра уходит вперёд, и без
+    # этой метки он не может оценить, насколько кадр уже устарел.
     info = (f"Window: {win.title}\n"
             f"Frame: {frame.width}x{frame.height} | client "
             f"{win.client_width}x{win.client_height} | focused: "
             f"{'yes' if winapi.is_foreground(win.hwnd) else 'no'}\n"
-            f"Capture: {frame.source}\n"
+            f"Capture: {frame.source} in {capture_ms} ms at "
+            f"{time.strftime('%H:%M:%S')}\n"
             f"Action coordinates are normalised 0..1 of the client area.")
     return [TextContent(type="text", text=info),
             ImageContent(type="image", data=base64.b64encode(frame.jpeg).decode(),
@@ -135,8 +185,9 @@ def look(window: str | None = None, background: bool = False,
 @server.tool(description=(
     "Perform actions in the window. Pass a list of objects, e.g. "
     '[{"type":"key","key":"w","hold":2.0},{"type":"wait","seconds":0.5}]. '
-    "Supported: key, key_press, key_down, key_up, type, move, click, "
-    "double_click, mouse_down, mouse_up, mouse_delta, scroll, wait."))
+    "Supported: key, key_press, key_down, key_up, keys_hold (several keys at "
+    "once), type, move, click, double_click, mouse_down, mouse_up, mouse_delta, "
+    "scroll, wait, autoclick (count or duration)."))
 def act(window: str | None = None, actions: list[dict] | None = None,
         background: bool = False, dry_run: bool = False) -> str:
     """Действия проходят тот же валидатор, что и в приложении.
@@ -162,14 +213,21 @@ def act(window: str | None = None, actions: list[dict] | None = None,
     if not background and not dry_run and not winapi.is_foreground(win.hwnd):
         winapi.focus_window(win.hwnd)
     try:
+        started = time.monotonic()
         report = executor.execute(cleaned, win, dry_run=dry_run)
+        elapsed = time.monotonic() - started
     except AgentError as exc:
         return f"Stopped: {exc}"
-    lines = [f"{'[dry-run] ' if dry_run else ''}{len(report)} action(s) done:"]
+    lines = [f"{'[dry-run] ' if dry_run else ''}{len(report)} action(s) done "
+             f"in {elapsed:.2f}s:"]
     lines.extend(f"  {line}" for line in report)
     if notes:
         lines.append("Validator notes:")
         lines.extend(f"  {note}" for note in notes)
+    # Агенту нужна фактическая длительность, а не заказанная: по ней он считает,
+    # сколько времени прошло в игре, пока он не смотрел.
+    lines.append(f"Elapsed: {elapsed:.2f}s. Look again before deciding the next "
+                 f"step — the game kept running.")
     return "\n".join(lines)
 
 

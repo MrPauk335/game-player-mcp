@@ -85,6 +85,131 @@ def main() -> int:
     bg = executor(background_mode=True)
     check("background_mode доходит до исполнителя", bg.cfg.background_mode is True)
 
+    print("\n=== одновременное зажатие нескольких клавиш ===")
+    cleaned, _ = ex.validate([{"type": "keys_hold", "keys": ["shift", "w"],
+                               "hold": 3.0}])
+    check("shift+w принимается", cleaned and cleaned[0]["keys"] == ["shift", "w"],
+          str(cleaned) if cleaned else "нет")
+    for label, keys in (("shift+w", "shift+w"), ("shift w", "shift w"),
+                        ("shift,w", "shift,w"), ("список", ["shift", "w"])):
+        cleaned, _ = ex.validate([{"type": "keys_hold", "keys": keys, "hold": 1}])
+        check(f"строка {label!r} разобрана",
+              cleaned and cleaned[0]["keys"] == ["shift", "w"],
+              str(cleaned[0]["keys"]) if cleaned else "нет")
+
+    cleaned, notes = ex.validate([{"type": "keys_hold", "keys": ["win", "w"],
+                                   "hold": 1}])
+    check("запрещённая клавиша выброшена из комбинации",
+          cleaned and cleaned[0]["keys"] == ["w"] and bool(notes),
+          str(cleaned) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "keys_hold",
+                               "keys": ["a", "b", "c", "d", "e", "f"], "hold": 1}])
+    check("число зажатых клавиш ограничено", cleaned and len(cleaned[0]["keys"]) <= 4,
+          str(cleaned[0]["keys"]) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "keys_hold", "keys": [], "hold": 1}])
+    check("пустая комбинация отклонена", cleaned == [], str(cleaned))
+    cleaned, _ = ex.validate([{"type": "keys_hold", "keys": ["shift", "w"],
+                               "hold": 9999}])
+    check("удержание комбинации ограничено",
+          cleaned and cleaned[0]["hold"] <= 10.0,
+          str(cleaned[0]["hold"]) if cleaned else "нет")
+
+    print("\n=== авто-кликер ===")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left",
+                               "clicks": 50, "interval": 0.04}])
+    check("кликер по числу кликов",
+          cleaned and cleaned[0]["clicks"] == 50, str(cleaned) if cleaned else "нет")
+    check("оценка длительности посчитана",
+          cleaned and cleaned[0].get("estimated_seconds") == 2.0,
+          str(cleaned[0].get("estimated_seconds")) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left",
+                               "seconds": 5}])
+    check("кликер по длительности",
+          cleaned and cleaned[0]["seconds"] == 5.0, str(cleaned) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left"}])
+    check("кликер без лимитов получает безопасный дефолт",
+          cleaned and cleaned[0]["clicks"] == 10, str(cleaned) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left",
+                               "clicks": 999999}])
+    check("число кликов ограничено", cleaned and cleaned[0]["clicks"] <= 500,
+          str(cleaned[0]["clicks"]) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left",
+                               "seconds": 9999}])
+    check("длительность кликера ограничена",
+          cleaned and cleaned[0]["seconds"] <= 30.0,
+          str(cleaned[0]["seconds"]) if cleaned else "нет")
+    cleaned, _ = ex.validate([{"type": "autoclick", "button": "left",
+                               "clicks": 10, "interval": 0}])
+    check("интервал не может быть нулевым",
+          cleaned and cleaned[0]["interval"] >= 0.01,
+          str(cleaned[0]["interval"]) if cleaned else "нет")
+    cleaned, notes = ex.validate([{"type": "autoclick", "button": "back",
+                                   "clicks": 5}])
+    check("неизвестная кнопка заменена на left",
+          cleaned and cleaned[0]["button"] == "left", str(cleaned) if cleaned else "нет")
+
+    print("\n=== шорткаты новых действий ===")
+    cleaned, _ = ex.validate(["keys_hold(shift+w, 2.5)"])
+    check("шорткат keys_hold разобран",
+          cleaned and cleaned[0]["keys"] == ["shift", "w"]
+          and cleaned[0]["hold"] == 2.5, str(cleaned) if cleaned else "нет")
+    cleaned, _ = ex.validate(["autoclick(left,30)"])
+    check("шорткат autoclick по числу",
+          cleaned and cleaned[0]["clicks"] == 30, str(cleaned) if cleaned else "нет")
+    cleaned, _ = ex.validate(["autoclick(left,3s)"])
+    check("шорткат autoclick по времени",
+          cleaned and cleaned[0].get("seconds") == 3.0,
+          str(cleaned) if cleaned else "нет")
+
+    print("\n=== порядок вызовов Win32 (без реального ввода) ===")
+    # Подменяем winapi, чтобы увидеть последовательность, а не трогать систему.
+    from game_player_mcp import executor as ex_mod, winapi as real_winapi
+
+    calls: list[str] = []
+    saved = {name: getattr(real_winapi, name) for name in
+             ("key_down", "key_up", "click", "move_mouse_screen")}
+    real_winapi.key_down = lambda k, m: calls.append(f"down:{k}")
+    real_winapi.key_up = lambda k, m: calls.append(f"up:{k}")
+    real_winapi.click = lambda b: calls.append(f"click:{b}")
+    real_winapi.move_mouse_screen = lambda x, y: calls.append("move")
+    try:
+        live = ActionExecutor(Config(), threading.Event())
+
+        cleaned, _ = live.validate([{"type": "keys_hold", "keys": ["shift", "w"],
+                                     "hold": 0.05}])
+        live.execute(cleaned, None, dry_run=False)
+        check("keys_hold зажимает обе клавиши до отпускания",
+              calls[:2] == ["down:shift", "down:w"], str(calls))
+        check("keys_hold отпускает обе клавиши",
+              set(calls[2:]) == {"up:shift", "up:w"}, str(calls))
+        check("после keys_hold ничего не зажато", live._held_keys == set(),
+              str(live._held_keys))
+
+        calls.clear()
+        cleaned, _ = live.validate([{"type": "autoclick", "button": "left",
+                                     "clicks": 5, "interval": 0.01}])
+        live.execute(cleaned, None, dry_run=False)
+        check("autoclick нажал ровно 5 раз",
+              calls.count("click:left") == 5, str(calls))
+
+        calls.clear()
+        cleaned, _ = live.validate([{"type": "autoclick", "button": "right",
+                                     "clicks": 3, "interval": 0.01}])
+        live.execute(cleaned, None, dry_run=False)
+        check("autoclick уважает кнопку мыши",
+              calls == ["click:right"] * 3, str(calls))
+
+        calls.clear()
+        live.abort.set()
+        cleaned, _ = live.validate([{"type": "autoclick", "button": "left",
+                                     "clicks": 50, "interval": 0.01}])
+        live.execute(cleaned, None, dry_run=False)
+        check("аварийный стоп прерывает кликер", len(calls) == 0, str(calls))
+        live.abort.clear()
+    finally:
+        for name, fn in saved.items():
+            setattr(real_winapi, name, fn)
+
     print("\n" + "=" * 60)
     print(f"ПРОЙДЕНО: {PASSED}   ПРОВАЛЕНО: {FAILED}")
     return 1 if FAILED else 0

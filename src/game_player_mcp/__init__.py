@@ -9,4 +9,4 @@ from .executor import ActionExecutor, AgentError
 from .server import server
 
 __all__ = ["Config", "ActionExecutor", "AgentError", "server"]
-__version__ = "1.0.0"
+__version__ = "1.1.0"

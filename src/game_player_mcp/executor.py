@@ -23,10 +23,21 @@ MAX_ACTIONS_PER_STEP = 8
 MAX_HOLD_SECONDS = 10.0
 MAX_WAIT_SECONDS = 10.0
 
+#: Потолок авто-кликера. Играм-кликерам нужно много, но бесконечный цикл в
+#: чужом процессе — это зависший агент, поэтому есть жёсткий предел и по числу,
+#: и по времени: что наступит раньше.
+MAX_CLICKS = 500
+MAX_AUTOCLICK_SECONDS = 30.0
+MIN_CLICK_INTERVAL = 0.01
+
+#: Сколько клавиш разрешено держать одновременно. Ходьба с ускорением — это
+#: shift+w, редко больше; лимит нужен, чтобы «зажать всё» не осталось зажатым.
+MAX_KEYS_HELD = 4
+
 ALLOWED_ACTIONS = {
-    "key", "key_press", "key_down", "key_up", "type",
+    "key", "key_press", "key_down", "key_up", "keys_hold", "type",
     "move", "click", "double_click", "mouse_down", "mouse_up",
-    "mouse_delta", "scroll", "wait",
+    "mouse_delta", "scroll", "wait", "autoclick",
 }
 
 
@@ -55,6 +66,14 @@ def _short_action(action: dict) -> str:
     if kind in ("key", "key_press", "key_down", "key_up"):
         hold = action.get("hold")
         return f"{kind}:{action.get('key')}" + (f"×{hold}s" if hold else "")
+    if kind == "keys_hold":
+        keys = action.get("keys") or []
+        return f"keys_hold:{'+'.join(keys)}×{action.get('hold')}s"
+    if kind == "autoclick":
+        button = action.get("button")
+        if action.get("clicks") is not None:
+            return f"autoclick:{button}×{action.get('clicks')}"
+        return f"autoclick:{button} {action.get('seconds')}s"
     if kind in ("move", "click", "double_click"):
         if kind == "move":
             return f"move({action.get('x')},{action.get('y')})"
@@ -124,6 +143,34 @@ def _action_from_shorthand(text: str) -> dict | None:
         return {"type": "wait", "seconds": seconds}
     if name in ("key", "key_press", "key_down", "key_up") and args:
         return {"type": name, "key": args[0]}
+    if name in ("keys_hold", "hold", "combo") and args:
+        # ``keys_hold(shift+w, 2.0)`` или ``hold(shift,w,2)``
+        keys = [k for k in re.split(r"[+\s,]+", args[0]) if k]
+        if not keys:
+            return None
+        out = {"type": "keys_hold", "keys": keys}
+        if len(args) > 1:
+            try:
+                out["hold"] = float(str(args[1]).rstrip("s"))
+            except ValueError:
+                pass
+        return out
+    if name == "autoclick" and args:
+        # ``autoclick(50)`` / ``autoclick(left,50)`` / ``autoclick(left,10s)``
+        button, value = "left", None
+        for token in args:
+            token = token.strip()
+            if token in ("left", "right", "middle"):
+                button = token
+            elif token:
+                value = token
+        out = {"type": "autoclick", "button": button}
+        if value:
+            if value.endswith("s"):
+                out["seconds"] = value.rstrip("s")
+            else:
+                out["clicks"] = value
+        return out
     if name == "scroll" and args:
         try:
             return {"type": "scroll", "amount": int(float(args[0]))}
@@ -266,6 +313,82 @@ class ActionExecutor:
                 if kind == "key":
                     hold = float(item.get("hold", 0.08) or 0)
                     item["hold"] = max(0.02, min(hold, MAX_HOLD_SECONDS))
+
+            elif kind == "keys_hold":
+                # Несколько клавиш одновременно — ходьба с ускорением (shift+w),
+                # приседание на ходу (ctrl+w), поворот с движением. Отдельным
+                # действием, потому что "key" держит ровно одну клавишу и
+                # отпускает её до начала следующего действия.
+                keys = item.get("keys")
+                if isinstance(keys, str):
+                    # "shift+w" / "shift w" / "shift,w" — модели пишут по-разному.
+                    keys = [k for k in re.split(r"[+\s,]+", keys) if k]
+                if not isinstance(keys, list) or not keys:
+                    notes.append("keys_hold без списка клавиш пропущен")
+                    continue
+                keys = [str(k).strip().lower() for k in keys if str(k).strip()]
+                if len(keys) > MAX_KEYS_HELD:
+                    notes.append(
+                        f"в keys_hold оставлены первые {MAX_KEYS_HELD} клавиш "
+                        f"из {len(keys)}")
+                    keys = keys[:MAX_KEYS_HELD]
+                bad = [k for k in keys if k in winapi.FORBIDDEN_KEYS]
+                if bad:
+                    notes.append(f"запрещённые клавиши отклонены: {bad}")
+                    keys = [k for k in keys if k not in winapi.FORBIDDEN_KEYS]
+                unknown = []
+                for key in keys:
+                    try:
+                        winapi.resolve_key(key)
+                    except ValueError as exc:
+                        unknown.append(str(exc))
+                if unknown:
+                    notes.extend(unknown)
+                    keys = [k for k in keys
+                            if k not in {u.split()[-1].strip("'") for u in unknown}]
+                if not keys:
+                    notes.append("в keys_hold не осталось допустимых клавиш")
+                    continue
+                if any(set(keys) | pressed >= set(c)
+                       for c in winapi.FORBIDDEN_COMBOS):
+                    notes.append(f"запрещённая комбинация отклонена: {keys}")
+                    continue
+                item["keys"] = keys
+                hold = float(item.get("hold", 0.5) or 0)
+                item["hold"] = max(0.05, min(hold, MAX_HOLD_SECONDS))
+
+            elif kind == "autoclick":
+                # Кликер с двумя ограничителями: по числу кликов и по времени.
+                # Что сработает раньше, то и остановит — иначе один промах в
+                # поле "clicks" превращается в бесконечный цикл.
+                button = str(item.get("button", "left")).strip().lower()
+                if button not in ("left", "right", "middle"):
+                    notes.append(f"кнопка мыши заменена на left: {button!r}")
+                    button = "left"
+                item["button"] = button
+                interval = float(item.get("interval", 0.05) or 0)
+                item["interval"] = max(MIN_CLICK_INTERVAL,
+                                       min(interval, 2.0))
+                clicks = item.get("clicks")
+                seconds = item.get("seconds")
+                if clicks is None and seconds is None:
+                    notes.append("autoclick без clicks и seconds заменён на 10 кликов")
+                    clicks = 10
+                if clicks is not None:
+                    clicks = int(_clamp(float(clicks), 1, MAX_CLICKS))
+                    item["clicks"] = clicks
+                if seconds is not None:
+                    seconds = _clamp(float(seconds), 0.1, MAX_AUTOCLICK_SECONDS)
+                    item["seconds"] = seconds
+                # Сколько успеет выйти по времени — показываем агенту заранее,
+                # чтобы он понимал реальную длительность шага.
+                if clicks is not None:
+                    item["estimated_seconds"] = round(
+                        clicks * item["interval"], 2)
+                if "x" in item or "y" in item:
+                    cleaned.append({"type": "move",
+                                    "x": _clamp01(item.get("x", 0.5)),
+                                    "y": _clamp01(item.get("y", 0.5))})
 
             elif kind in ("move",):
                 item["x"] = _clamp01(item.get("x", 0.5))
@@ -419,6 +542,23 @@ class ActionExecutor:
                 self._held_keys.discard(key)
             return f"⌨ удержание {key} {hold:.2f}s (фон)"
 
+        if kind == "keys_hold":
+            keys, hold = action["keys"], action["hold"]
+            started = time.monotonic()
+            if not dry_run:
+                self._release_keys(dry_run)
+                for key in keys:
+                    winapi.post_key(hwnd, key, True)
+                    self._held_keys.add(key)
+                self._sleep(hold)
+                self._release_keys(dry_run)
+            elapsed = time.monotonic() - started
+            return (f"⌨ удержание {'+'.join(keys)} {hold:.2f}s "
+                    f"(факт {elapsed:.2f}s, фон)")
+
+        if kind == "autoclick":
+            return self._run_autoclick(action, window, dry_run)
+
         if kind == "key_press":
             key = action["key"]
             if not dry_run:
@@ -515,6 +655,26 @@ class ActionExecutor:
                 self._held_keys.discard(key)
             return f"⌨ удержание {key} {hold:.2f}s"
 
+        if kind == "keys_hold":
+            keys, hold = action["keys"], action["hold"]
+            started = time.monotonic()
+            if not dry_run:
+                # Отпускаем всё, что осталось от прошлых действий: иначе
+                # комбинация накладывается на чужую зажатую клавишу и игра
+                # получает не то, что просили.
+                self._release_keys(dry_run)
+                for key in keys:
+                    winapi.key_down(key, mode)
+                    self._held_keys.add(key)
+                self._sleep(hold)
+                self._release_keys(dry_run)
+            elapsed = time.monotonic() - started
+            return (f"⌨ удержание {'+'.join(keys)} {hold:.2f}s "
+                    f"(факт {elapsed:.2f}s)")
+
+        if kind == "autoclick":
+            return self._run_autoclick(action, window, dry_run)
+
         if kind == "key_press":
             key = action["key"]
             if not dry_run:
@@ -595,6 +755,49 @@ class ActionExecutor:
             int(live.client_left + x * live.client_width),
             int(live.client_top + y * live.client_height),
         )
+
+    def _run_autoclick(self, action: dict,
+                       window: winapi.WindowInfo | None, dry_run: bool) -> str:
+        """Кликать, пока не сработает первый из двух ограничителей.
+
+        Ограничителей именно два. ``clicks`` задаёт серию, ``seconds`` —
+        длительность: если модель ошибётся в счёте, цикл всё равно остановится
+        по времени. Событие аварийного сброса проверяется на каждой итерации,
+        поэтому стоп срабатывает посреди серии, а не после неё.
+
+        Темп держится по расписанию, а не фиксированной паузой: сам клик тоже
+        занимает время, и без вычета факческая частота выходит ниже заказанной.
+        """
+        button = action["button"]
+        interval = action["interval"]
+        clicks = action.get("clicks")
+        seconds = action.get("seconds")
+        background = getattr(self.cfg, "background_mode", False)
+        hwnd = window.hwnd if window is not None else 0
+
+        started = time.monotonic()
+        done = 0
+        while True:
+            if self.abort.is_set():
+                break
+            if clicks is not None and done >= clicks:
+                break
+            if seconds is not None and time.monotonic() - started >= seconds:
+                break
+            if not dry_run:
+                if background:
+                    cx, cy = self._background_cursor
+                    winapi.post_click(hwnd, button, cx, cy)
+                else:
+                    winapi.click(button)
+            done += 1
+            remaining = started + done * interval - time.monotonic()
+            if remaining > 0:
+                self._sleep(remaining)
+        elapsed = time.monotonic() - started
+        rate = done / elapsed if elapsed > 0 else 0.0
+        return (f"🖱 авто-клик {button} × {done} за {elapsed:.2f}s "
+                f"({rate:.1f}/с)")
 
     def _release_keys(self, dry_run: bool) -> None:
         held = sorted(self._held_keys)
